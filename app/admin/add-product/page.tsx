@@ -36,7 +36,9 @@ export default function AdminUploadPage() {
 
     try {
       const decoded: any = jwtDecode(token);
-      if (decoded.role !== "admin") {
+      const allowedRoles = ["admin", "seller", "ADMIN", "SELLER"]; 
+    
+    if (!allowedRoles.includes(decoded.role)) {
         router.push("/"); // Kick regular users back to the store
       } else {
         setIsAuthorized(true); // Welcome, Admin!

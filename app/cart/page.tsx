@@ -40,23 +40,21 @@ export default function CartPage() {
   const [isDeletingId, setIsDeletingId] = useState<string | null>(null); 
   const [editingAddressId, setEditingAddressId] = useState<string | null>(null); 
 
+  // 🔥 NEW: Delivery Method State
+  const [deliveryMethod, setDeliveryMethod] = useState<'VENDOR' | 'PLATFORM'>('VENDOR');
+
+  // 🔥 NEW: Dynamic Logistics States
+  const [shippingFee, setShippingFee] = useState<number>(0);
+  const [shippingDuration, setShippingDuration] = useState<string>("");
+  const [isCalculatingShipping, setIsCalculatingShipping] = useState(false);
+  const [shippingError, setShippingError] = useState("");
+
   const activeCartItems = cart.filter(item => !savedItems.find(saved => saved.id === item.id));
   const subtotal = activeCartItems.reduce((total, item) => total + item.price * item.quantity, 0);
 
   const selectedAddress = savedAddresses.find(a => a.id === selectedAddressId);
   
-  const calculateShippingFee = () => {
-    if (activeCartItems.length === 0) return 0;
-    if (!selectedAddress) return 0; 
-
-    const city = selectedAddress.city.toLowerCase();
-    if (city.includes("nairobi")) return 250;
-    if (city.includes("mombasa") || city.includes("kisumu")) return 500;
-    return 400; 
-  };
-
-  const shipping = calculateShippingFee(); 
-  const totalPrice = subtotal + shipping;
+  const totalPrice = subtotal + shippingFee;
 
   const formatPrice = (amount: number) => {
     return Number(amount).toLocaleString('en-US', {
@@ -65,6 +63,53 @@ export default function CartPage() {
     });
   };
 
+  // ========================================================
+  // 🔥 DYNAMIC SHIPPING LOGIC (Google Maps Distance Matrix)
+  // ========================================================
+  useEffect(() => {
+    const fetchShippingEstimate = async () => {
+      if (!selectedAddress || activeCartItems.length === 0) return;
+
+      setIsCalculatingShipping(true);
+      setShippingError("");
+
+      try {
+        // NOTE: If cart has multiple vendors, this currently picks the first item's vendor.
+        // You can expand this later to loop through vendors and calculate multiple fees if needed!
+        const firstItem = activeCartItems[0] as any;
+        const vendorLocation = firstItem?.location 
+          ? `${firstItem.location}, Kenya` 
+          : "CBD, Nakuru, Kenya"; // Fallback origin
+          
+        const buyerLocation = `${selectedAddress.streetAddress}, ${selectedAddress.city}, Kenya`;
+
+        const res = await fetch(
+          `http://localhost:3000/logistics/estimate?origin=${encodeURIComponent(vendorLocation)}&destination=${encodeURIComponent(buyerLocation)}`
+        );
+
+        const data = await res.json();
+
+        if (!res.ok) throw new Error(data.message || "Failed to calculate shipping.");
+
+        setShippingFee(data.shippingFee || 0);
+        setShippingDuration(data.estimatedDuration || "");
+
+      } catch (err: any) {
+        console.error(err);
+        setShippingError(err.message || "Delivery route not found.");
+        setShippingFee(0);
+        setShippingDuration("");
+      } finally {
+        setIsCalculatingShipping(false);
+      }
+    };
+
+    fetchShippingEstimate();
+  }, [selectedAddressId, activeCartItems.length]); // Auto-calculates anytime address or cart changes!
+
+  // ========================================================
+  // ADDRESS MANAGEMENT
+  // ========================================================
   useEffect(() => {
     const fetchAddresses = async () => {
       const token = localStorage.getItem("token");
@@ -258,10 +303,17 @@ export default function CartPage() {
     }
   };
 
-  // 🔥 UPDATED: INTASEND CHECKOUT LOGIC
+  // ========================================================
+  // INTASEND CHECKOUT LOGIC
+  // ========================================================
   const handleCheckout = async () => {
     if (!selectedAddress) {
       setMessage({ type: 'error', text: "Please select a shipping address before proceeding." });
+      return;
+    }
+    
+    if (isCalculatingShipping) {
+      setMessage({ type: 'error', text: "Please wait for shipping calculation to complete." });
       return;
     }
 
@@ -281,7 +333,8 @@ export default function CartPage() {
         phoneNumber: selectedAddress.phoneNumber, 
         paymentMethod: "INTASEND", 
         shippingAddress: selectedAddress, 
-        shippingFee: shipping,
+        shippingFee: shippingFee, 
+        deliveryMethod: deliveryMethod, 
         items: activeCartItems.map(item => ({
           productId: item.id,
           quantity: item.quantity
@@ -302,18 +355,24 @@ export default function CartPage() {
         throw new Error(errData.message || "Failed to place order.");
       }
 
-      const createdOrder = await orderRes.json(); 
+      // 🔥 FIX: Extract the payload properly
+      const createdOrderResponse = await orderRes.json(); 
+      const actualOrder = createdOrderResponse.order; // Drill down into the nested 'order' object
+
+      if (!actualOrder || !actualOrder.id) {
+        throw new Error("Server failed to return a valid Order ID.");
+      }
 
       // 2. Prepare IntaSend Payload
       const paymentPayload = {
         order: {
-          id: createdOrder.id || Math.floor(Math.random() * 10000), // Fallback if backend doesn't return an ID
+          id: actualOrder.id, // 🔥 GUARANTEED to be the real Database ID (e.g., 150)
           totalAmount: totalPrice,
-          sellerId: activeCartItems[0]?.sellerId || 1, // Assumes item 0 for the escrow split demo
-          shippingFee: shipping, 
+          sellerId: activeCartItems[0]?.sellerId || 1, 
+          shippingFee: shippingFee, 
         },
         customer: {
-          email: "customer@example.com", // You can pull actual email from the token/context later
+          email: "customer@example.com", 
           name: selectedAddress.fullName,
         }
       };
@@ -504,7 +563,7 @@ export default function CartPage() {
                               </div>
                             </div>
                             <p className="text-sm text-gray-600 mb-1">{address.streetAddress}, {address.city}</p>
-                            <p className="text-sm text-gray-900 font-medium">📱 {address.phoneNumber}</p>
+                            <p className="text-sm text-gray-900 font-medium">📞 {address.phoneNumber}</p>
                             {address.isDefault && <span className="inline-block mt-2 bg-gray-200 text-gray-700 text-[10px] font-bold px-2 py-0.5 rounded uppercase">Default Address</span>}
                           </div>
                         ))}
@@ -512,7 +571,7 @@ export default function CartPage() {
                     )}
 
                     {(showAddressForm || savedAddresses.length === 0) && (
-                      <form onSubmit={handleSaveAddress} className="space-y-4">
+                      <form onSubmit={handleSaveAddress} className="space-y-4 mt-6">
                         <div className="flex justify-between items-center mb-4 pb-2 border-b border-gray-100">
                           <h3 className="font-bold text-gray-800">{editingAddressId ? "Edit Address" : "Enter New Address"}</h3>
                           {!editingAddressId && (
@@ -618,23 +677,84 @@ export default function CartPage() {
                 <span>Ksh {formatPrice(subtotal)}</span>
               </div>
               
-              <div className="flex justify-between items-center pb-4 border-b border-gray-100">
+              {/* 🔥 UPDATED: Dynamic Shipping Display */}
+              <div className={`flex justify-between items-center pb-4 border-b border-gray-100 ${shippingDuration ? '' : 'border-b'}`}>
                 <span>Shipping Fee</span>
                 <span className="font-medium text-gray-900">
-                  {selectedAddress ? `Ksh ${formatPrice(shipping)}` : <span className="text-orange-500 text-sm italic">Select Address</span>}
+                  {isCalculatingShipping ? (
+                    <span className="text-blue-500 text-sm italic animate-pulse">Calculating...</span>
+                  ) : selectedAddress ? (
+                    `Ksh ${formatPrice(shippingFee)}`
+                  ) : (
+                    <span className="text-orange-500 text-sm italic">Select Address</span>
+                  )}
                 </span>
               </div>
               
+              {shippingDuration && !isCalculatingShipping && (
+                 <div className="flex justify-between items-center pb-4 border-b border-gray-100 text-sm">
+                   <span className="text-gray-500">Est. Delivery</span>
+                   <span className="font-medium text-green-600 bg-green-50 px-2 py-0.5 rounded">{shippingDuration}</span>
+                 </div>
+              )}
+
+              {shippingError && (
+                 <div className="pb-2 text-xs text-red-500 text-right font-bold">
+                   {shippingError}
+                 </div>
+              )}
+              
               <div className="flex justify-between items-end pt-2">
                 <span className="text-xl font-bold text-gray-900">Total</span>
-                <span className="text-3xl font-bold text-gray-900">Ksh {formatPrice(totalPrice)}</span>
+                <span className="text-3xl font-bold text-gray-900">
+                  {isCalculatingShipping ? "..." : `Ksh ${formatPrice(totalPrice)}`}
+                </span>
               </div>
             </div>
 
-            {/* 🔥 UPDATED: New Payment Button */}
+            {/* 🔥 NEW: Delivery Method Selection */}
+            <div className="mb-6 bg-white p-4 rounded-xl shadow-sm border border-gray-100">
+              <h3 className="text-lg font-semibold mb-3 text-gray-800">Delivery Method</h3>
+              <div className="space-y-3">
+                
+                {/* Vendor Delivery Option */}
+                <label className={`flex items-center p-3 border rounded-lg cursor-pointer transition-colors ${deliveryMethod === 'VENDOR' ? 'border-green-500 bg-green-50' : 'border-gray-200 hover:bg-gray-50'}`}>
+                  <input 
+                    type="radio" 
+                    name="deliveryMethod" 
+                    value="VENDOR" 
+                    checked={deliveryMethod === 'VENDOR'} 
+                    onChange={() => setDeliveryMethod('VENDOR')} 
+                    className="w-4 h-4 text-green-600 bg-white border-gray-300 focus:ring-green-500"
+                  />
+                  <div className="ml-3">
+                    <span className="block text-sm font-medium text-gray-900">Standard Delivery</span>
+                    <span className="block text-xs text-gray-500">The seller handles the shipping and delivery directly to you.</span>
+                  </div>
+                </label>
+
+                {/* Platform Delivery Option */}
+                <label className={`flex items-center p-3 border rounded-lg cursor-pointer transition-colors ${deliveryMethod === 'PLATFORM' ? 'border-green-500 bg-green-50' : 'border-gray-200 hover:bg-gray-50'}`}>
+                  <input 
+                    type="radio" 
+                    name="deliveryMethod" 
+                    value="PLATFORM" 
+                    checked={deliveryMethod === 'PLATFORM'} 
+                    onChange={() => setDeliveryMethod('PLATFORM')} 
+                    className="w-4 h-4 text-green-600 bg-white border-gray-300 focus:ring-green-500"
+                  />
+                  <div className="ml-3">
+                    <span className="block text-sm font-medium text-gray-900">Premium Platform Delivery</span>
+                    <span className="block text-xs text-gray-500">Our platform handles the logistics for faster, secure delivery.</span>
+                  </div>
+                </label>
+
+              </div>
+            </div>
+
             <button 
               onClick={handleCheckout}
-              disabled={isCheckingOut || activeCartItems.length === 0 || !selectedAddress}
+              disabled={isCheckingOut || isCalculatingShipping || activeCartItems.length === 0 || !selectedAddress}
               className="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-4 px-4 rounded-full transition-colors text-lg shadow-sm flex justify-center items-center disabled:opacity-70 disabled:cursor-not-allowed"
             >
               {isCheckingOut ? (
@@ -645,7 +765,6 @@ export default function CartPage() {
               ) : "Pay Now (M-Pesa / Card)"}
             </button>
 
-            {/* 🔥 UPDATED: Helpful text */}
             <p className="text-xs text-center text-gray-500 mt-4">
               {selectedAddress 
                 ? "You will be redirected securely to pay via M-Pesa, Visa, Mastercard, or PesaLink." 

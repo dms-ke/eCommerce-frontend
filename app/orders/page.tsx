@@ -99,13 +99,23 @@ export default function OrdersPage() {
   const [error, setError] = useState("");
   const router = useRouter();
 
-  // 🔥 UPDATED: Added `id` to the chatSeller state to track the Seller ID
+  // Chat State
   const [chatSeller, setChatSeller] = useState<{ name: string, id: number, orderId: number, productId: number, productName: string } | null>(null);
   const [chatMessage, setChatMessage] = useState("");
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]); 
   const chatEndRef = useRef<HTMLDivElement>(null); 
-  
   const [socket, setSocket] = useState<Socket | null>(null);
+
+  // 🔥 ESCROW STATE ADDED
+  // 🔥 NEW DISPUTE STATES
+  const [processingEscrowId, setProcessingEscrowId] = useState<number | null>(null);
+  
+  // We now store the entire Order object so we can extract Product IDs and Seller IDs
+  const [selectedOrderForDispute, setSelectedOrderForDispute] = useState<Order | null>(null);
+  const [disputeReason, setDisputeReason] = useState("");
+  
+  // New state to hold the uploaded images (as Base64 strings)
+  const [disputePhotos, setDisputePhotos] = useState<string[]>([]);
 
   useEffect(() => {
     const newSocket = io("http://localhost:3000");
@@ -145,7 +155,7 @@ export default function OrdersPage() {
   }, [router]);
 
   const isCancellable = (order: Order) => {
-    if (order.status === 'PENDING') return true;
+    if (order.status === 'PENDING_PAYMENT') return true;
     if (order.status === 'PAID') {
       const orderTime = new Date(order.orderDate).getTime();
       const now = new Date().getTime();
@@ -182,12 +192,114 @@ export default function OrdersPage() {
     }
   };
 
- useEffect(() => {
+  // 🔥 ESCROW ACTION: Confirm Delivery
+  const handleConfirmDelivery = async (orderId: number) => {
+    if (!confirm("Are you sure you have received this order in good condition? This will instantly release the payment to the seller.")) return;
+    
+    setProcessingEscrowId(orderId);
+    try {
+      const token = localStorage.getItem('token');
+      const res = await fetch(`http://localhost:3000/payments/${orderId}/confirm-delivery`, {
+        method: 'PATCH',
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      
+      if (!res.ok) {
+        const errorData = await res.json();
+        throw new Error(errorData.message || "Failed to confirm delivery");
+      }
+      
+      setOrders(prevOrders => prevOrders.map(order => 
+        order.id === orderId ? { ...order, status: 'DELIVERED' } : order
+      ));
+      alert("Thank you! Delivery confirmed and funds have been released to the seller.");
+    } catch (err: any) {
+      alert(`Error: ${err.message}`);
+    } finally {
+      setProcessingEscrowId(null);
+    }
+  };
+
+  // 🔥 NEW: Handlers for the image upload
+  const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!e.target.files) return;
+    const files = Array.from(e.target.files);
+    
+    // Limit to 3 photos to prevent massive payload sizes
+    if (disputePhotos.length + files.length > 3) {
+      return alert("You can only upload up to 3 photos.");
+    }
+
+    files.forEach(file => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setDisputePhotos(prev => [...prev, reader.result as string]);
+      };
+      reader.readAsDataURL(file); // Converts image to Base64 text
+    });
+  };
+
+  const removePhoto = (index: number) => {
+    setDisputePhotos(prev => prev.filter((_, i) => i !== index));
+  };
+
+
+  const submitDispute = async () => {
+  if (!selectedOrderForDispute || !disputeReason.trim()) return;
+  
+  const orderToDispute = selectedOrderForDispute;
+  setProcessingEscrowId(orderToDispute.id);
+  
+  try {
+    const token = localStorage.getItem('token');
+    const firstItem = orderToDispute.items[0];
+    
+    const payload = {
+      orderId: orderToDispute.id,
+      productId: firstItem.product.id,
+      productName: firstItem.product.name,
+      sellerId: firstItem.product.sellerId || 1, 
+      amount: orderToDispute.totalAmount,
+      reason: disputeReason,
+      photos: disputePhotos 
+    };
+
+    const res = await fetch(`http://localhost:3000/disputes`, {
+      method: 'POST',
+      headers: { 
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    });
+    
+    if (!res.ok) {
+      const errorData = await res.json();
+      throw new Error(errorData.message || "Failed to open dispute");
+    }
+    
+    setOrders(prevOrders => prevOrders.map(order => 
+      order.id === orderToDispute.id ? { ...order, status: 'DISPUTED' } : order
+    ));
+    
+    // Clear Modal states
+    setSelectedOrderForDispute(null); // <-- FIXED
+    setDisputeReason("");
+    setDisputePhotos([]); 
+    
+    alert("Dispute opened successfully. The seller has been notified with your evidence.");
+  } catch (err: any) {
+    alert(`Error: ${err.message}`);
+  } finally {
+    setProcessingEscrowId(null);
+  }
+};
+
+  useEffect(() => {
     if (chatSeller && socket) {
       const fetchHistory = async () => {
         const token = localStorage.getItem("token");
         try {
-          // 🔥 FIX: Changed chatSeller.name to chatSeller.id in the URL
           const res = await fetch(`http://localhost:3000/messages/${chatSeller.id}/${chatSeller.orderId}/${chatSeller.productId}`, {
             headers: { "Authorization": `Bearer ${token}` }
           });
@@ -248,8 +360,8 @@ export default function OrdersPage() {
           "Authorization": `Bearer ${token}`
         },
         body: JSON.stringify({
-          sellerId: chatSeller.id,     // 🔥 UPDATED: Send the ID to the backend
-          sellerName: chatSeller.name, // Keep sending the name for UI purposes
+          sellerId: chatSeller.id,     
+          sellerName: chatSeller.name, 
           content: messageContent,
           orderId: chatSeller.orderId,
           productId: chatSeller.productId 
@@ -313,9 +425,11 @@ export default function OrdersPage() {
                     <div className="sm:text-right">
                       <span className={`inline-flex items-center px-3 py-1 rounded-full text-xs font-bold tracking-wide uppercase ${
                         order.status === 'PAID' ? 'bg-green-100 text-green-800' : 
+                        order.status === 'DELIVERED' ? 'bg-blue-100 text-blue-800' : 
                         order.status === 'PENDING' ? 'bg-yellow-100 text-yellow-800' : 
+                        order.status === 'DISPUTED' ? 'bg-red-100 text-red-800' :
                         order.status === 'CANCELLED' ? 'bg-red-100 text-red-800' :
-                        'bg-blue-100 text-blue-800'
+                        'bg-purple-100 text-purple-800' // For SHIPPED
                       }`}>
                         {order.status}
                       </span>
@@ -366,10 +480,9 @@ export default function OrdersPage() {
                                   </p>
                                   
                                   <button 
-                                    // 🔥 UPDATED: Capture both the display name AND the numeric ID
                                     onClick={() => setChatSeller({ 
                                       name: sellerLabel, 
-                                      id: item.product?.sellerId || 4, // Falls back to 4 if your API hasn't updated the product response yet
+                                      id: item.product?.sellerId || 4, 
                                       orderId: order.id, 
                                       productId: item.product?.id,
                                       productName: item.product?.name || 'Item'
@@ -431,7 +544,7 @@ export default function OrdersPage() {
                             {order.status !== 'PAID' ? (
                               <span className="flex items-center gap-1 font-semibold bg-yellow-50 text-yellow-700 border border-yellow-200 px-2 py-0.5 rounded text-xs tracking-wider uppercase">
                                 <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                                PENDING PAYMENT
+                                PENDING_PAYMENT
                               </span>
                             ) : (order.paymentMethod?.toUpperCase() === 'M-PESA' || order.paymentMethod?.toUpperCase() === 'MPESA') ? (
                               <span className="flex items-center gap-1 font-semibold bg-[#E8F5E9] text-[#2E7D32] border border-[#A5D6A7] px-2 py-0.5 rounded text-xs tracking-wider uppercase">
@@ -456,28 +569,60 @@ export default function OrdersPage() {
                         </div>
                       </div>
 
-                      {isCancellable(order) && (
-                        <div className="mt-6 pt-4 border-t border-gray-200">
-                          <button
-                            onClick={() => handleCancelOrder(order.id)}
-                            className="w-full bg-white border border-red-200 text-red-600 font-medium py-2.5 rounded-lg hover:bg-red-50 hover:text-red-700 transition-colors shadow-sm text-sm"
-                          >
-                            Cancel Order
-                          </button>
-                          
-                          {order.status === 'PAID' && (
-                            <p className="text-xs text-gray-500 text-center mt-2 flex items-center justify-center">
-                              <svg className="w-3.5 h-3.5 mr-1 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                              Window closes in: 
-                              <OrderCountdown 
-                                orderDate={order.orderDate} 
-                                onExpire={() => setOrders(prev => [...prev])} 
-                              />
-                            </p>
-                          )}
-                        </div>
-                      )}
+                      {/* ACTIONS AREA */}
+                      <div className="mt-6 pt-4 border-t border-gray-200 flex flex-col gap-3">
+                        
+                        {/* Escrow Buttons - Only show when SHIPPED */}
+                        {order.status === 'SHIPPED' && (
+                          <div className="flex flex-col gap-2">
+                            <button 
+                              onClick={() => handleConfirmDelivery(order.id)}
+                              disabled={processingEscrowId === order.id}
+                              className="w-full bg-green-600 text-white px-4 py-2.5 rounded-lg text-sm font-medium hover:bg-green-700 transition shadow-sm disabled:opacity-50 flex items-center justify-center"
+                            >
+                              {processingEscrowId === order.id ? (
+                                <span className="animate-pulse">Processing...</span>
+                              ) : (
+                                <>
+                                  <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7"></path></svg>
+                                  Confirm Receipt
+                                </>
+                              )}
+                            </button>
+                            
+                           <button 
+  onClick={() => setSelectedOrderForDispute(order)} // 🔥 Now saves the FULL order object
+  className="text-xs text-center text-red-600 hover:text-red-800 underline mt-1 font-medium transition-colors"
+>
+  Item damaged or not as described? Report an issue
+</button>
+</div>
+)} {/* <--- ADD THESE TWO LINES */}
 
+                        {/* Cancel Order Button */}
+                        {isCancellable(order) && (
+                          <div>
+                            <button
+                              onClick={() => handleCancelOrder(order.id)}
+                              className="w-full bg-white border border-red-200 text-red-600 font-medium py-2.5 rounded-lg hover:bg-red-50 hover:text-red-700 transition-colors shadow-sm text-sm"
+                            >
+                              Cancel Order
+                            </button>
+                            
+                            {order.status === 'PAID' && (
+                              <p className="text-xs text-gray-500 text-center mt-2 flex items-center justify-center">
+                                <svg className="w-3.5 h-3.5 mr-1 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                                Window closes in: 
+                                <OrderCountdown 
+                                  orderDate={order.orderDate} 
+                                  onExpire={() => setOrders(prev => [...prev])} 
+                                />
+                              </p>
+                            )}
+                          </div>
+                        )}
+
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -487,6 +632,77 @@ export default function OrdersPage() {
         )}
       </div>
 
+      {/* DISPUTE MODAL */}
+      {selectedOrderForDispute && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-[60] p-4">
+          <div className="bg-white rounded-xl p-6 max-w-md w-full shadow-2xl transform transition-all">
+            <div className="flex items-center justify-center w-12 h-12 mx-auto bg-red-100 rounded-full mb-4">
+              <svg className="w-6 h-6 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+            </div>
+            <h3 className="text-xl font-bold text-gray-900 text-center mb-2">Report an Issue</h3>
+            <p className="text-sm text-gray-600 text-center mb-6">
+              Please describe the problem with your order.
+            </p>
+            
+            <textarea
+              value={disputeReason}
+              onChange={(e) => setDisputeReason(e.target.value)}
+              className="w-full border border-gray-300 rounded-lg p-3 mb-6 text-gray-900 focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition"
+              rows={4}
+              placeholder="E.g., The item arrived broken, wrong color sent, missing pieces..."
+            />
+
+            {/* 👇 👇 👇 PASTE THE NEW UPLOAD EVIDENCE CODE HERE 👇 👇 👇 */}
+            <div className="mt-4 mb-6">
+              <label className="block text-sm font-bold text-gray-700 mb-2">Upload Evidence (Max 3)</label>
+              
+              <div className="flex flex-wrap gap-3">
+                {/* Image Previews */}
+                {disputePhotos.map((photo, idx) => (
+                  <div key={idx} className="relative w-20 h-20 border border-gray-200 rounded-lg overflow-hidden group">
+                    <img src={photo} alt="evidence" className="w-full h-full object-cover" />
+                    <button 
+                      onClick={() => removePhoto(idx)}
+                      className="absolute top-1 right-1 bg-red-600 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity shadow-md"
+                    >
+                      <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    </button>
+                  </div>
+                ))}
+
+                {/* Upload Button */}
+                {disputePhotos.length < 3 && (
+                  <label className="w-20 h-20 border-2 border-dashed border-gray-300 rounded-lg flex flex-col items-center justify-center cursor-pointer hover:bg-gray-50 hover:border-blue-400 transition text-gray-500 hover:text-blue-500">
+                    <svg className="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                    <span className="text-[10px] font-bold">Add Photo</span>
+                    <input type="file" multiple accept="image/*" onChange={handlePhotoUpload} className="hidden" />
+                  </label>
+                )}
+              </div>
+            </div>
+      
+            {/* 👆 👆 👆 END OF UPLOAD EVIDENCE CODE 👆 👆 👆 */}
+            
+            <div className="flex gap-3 justify-end">
+              <button 
+                onClick={() => { setSelectedOrderForDispute(null); setDisputeReason(""); }}
+                className="px-5 py-2.5 border border-gray-300 rounded-lg text-gray-700 font-medium hover:bg-gray-50 transition"
+              >
+                Cancel
+              </button>
+              <button 
+                onClick={submitDispute}
+                disabled={processingEscrowId === selectedOrderForDispute.id  || !disputeReason.trim()}
+                className="px-5 py-2.5 bg-red-600 text-white rounded-lg font-medium hover:bg-red-700 disabled:opacity-50 transition flex items-center shadow-sm"
+              >
+                {processingEscrowId === selectedOrderForDispute.id ? 'Submitting...' : 'Submit Dispute'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* EXISTING CHAT MODAL */}
       {chatSeller && (
         <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 backdrop-blur-sm">
           <div className="bg-white rounded-2xl w-full max-w-md shadow-2xl overflow-hidden flex flex-col transform transition-all">
@@ -496,7 +712,6 @@ export default function OrdersPage() {
                   {chatSeller.name.substring(0, 2).toUpperCase()}
                 </div>
                 <div>
-                  {/* Customer sees the human-readable Store Name here! */}
                   <h3 className="font-bold">{chatSeller.name}</h3>
                   <p className="text-xs text-blue-100 line-clamp-1">Regarding: {chatSeller.productName}</p>
                 </div>

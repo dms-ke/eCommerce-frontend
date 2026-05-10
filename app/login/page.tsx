@@ -38,12 +38,14 @@ export default function LoginPage() {
       if (token) {
         localStorage.setItem("token", token);
         
-        // 🔥 NEW: Decode the token to find out their role
+        // Decode the token to find out their role
         const decoded: any = jwtDecode(token);
         
-        // 🔥 NEW: Smart Redirection based on role
-        if (decoded.role === 'admin') {
-          router.push("/admin/dashboard"); // Admins go to their control panel
+        // 🔥 UPDATED: Smart Redirection based on role (Allows both Admins and Sellers)
+        const allowedDashboardRoles = ['admin', 'ADMIN', 'seller', 'SELLER'];
+        
+        if (allowedDashboardRoles.includes(decoded?.role)) {
+          router.push("/admin/dashboard"); // Admins and Sellers go to their control panel
         } else {
           router.push("/"); // Standard customers go to the storefront
         }
@@ -55,7 +57,7 @@ export default function LoginPage() {
       setIsLoading(false);
     }
   };
-
+  
   const handleSocialLogin = (provider: string) => {
     console.log(`Logging in with ${provider}...`);
     // TODO: Implement OAuth logic later

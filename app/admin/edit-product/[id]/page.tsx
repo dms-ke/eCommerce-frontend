@@ -38,7 +38,7 @@ export default function EditProductPage() {
 
     try {
       const decoded: any = jwtDecode(token);
-      if (decoded.role !== "admin") {
+      if (decoded.role !== "admin" && decoded.role !== "seller") {
         router.push("/"); 
         return;
       }
